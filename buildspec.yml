@@ -1,3 +1,4 @@
+
 version: 0.2
 
 phases:
@@ -9,6 +10,7 @@ phases:
 
     # Use go modules rather than GOPATH
     - export GO111MODULE="on"
+
 
     # Install golint
     - go get golang.org/x/lint/golint@v0.0.0-20210508222113-6edffad5e616
@@ -25,7 +27,8 @@ phases:
     # Ensure code passes all lint tests
     - golint -set_exit_status
 
-    # Check for common Go application problems with 'go vet'
+    # Check for common Go application problems with 'go vet'-
+    - go mod init .
     - go vet .
 
     # Run all tests included with our application
