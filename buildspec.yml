@@ -1,56 +1,270 @@
-
-version: 0.2
-
-phases:
-
-  install:
-    runtime-versions:
-      golang: 1.13
-    commands:
-
-    # Use go modules rather than GOPATH
-    - export GO111MODULE="on"
+AWSTemplateFormatVersion: 2010-09-09
+Description: Create CodeDeploy Stack Template
 
 
-    # Install golint
-    - go get golang.org/x/lint/golint@v0.0.0-20210508222113-6edffad5e616
+Parameters:
+  ApplicationRepoName:
+    Type: String
+    Description: Name of the repo which contains Rest Application.
+    Default: ccdemo
+  ArtifactStoreS3Location:
+    Type: String
+    Description: Name of the S3 bucket to store CodePipeline artificat.
+    Default: rest-apps
+  Email: 
+    Type: String
+    Description: Email address to send notifications
+    Default: dkalyanreddy@gmail.com
+        
 
-    # Install Testify to use common assertions and mocks in tests
-    - go get -u github.com/stretchr/testify@v1.6.1
+Resources:
+  CodeBuildRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName:
+        Fn::Sub: CodeBuildRole-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "codebuild.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: /service-role/
+      Policies:
+        - PolicyName: "CodeBuildCICDAccessPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "codecommit:GitPull"
+                Resource:
+                  - Fn::Sub: arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${ApplicationRepoName}
+              - Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - Fn::Sub: arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*
+              - Effect: "Allow"
+                Action:
+                  - "s3:PutObject"
+                  - "s3:GetObject"
+                  - "s3:GetObjectVersion"
+                  - "s3:ListBucket"
+                Resource:
+                  - Fn::Sub: arn:aws:s3:::codepipeline-${AWS::Region}-*
+                  - Fn::Sub: arn:aws:s3:::${ArtifactStoreS3Location}/*
+                  - Fn::Sub: arn:aws:s3:::${ArtifactStoreS3Location}
 
-  pre_build:
-    commands:
+  BuildRestAppCFNProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub BuildRestAppCFN-${AWS::StackName}
+      Description: Build war file for rest application
+      ServiceRole: !GetAtt [ CodeBuildRole, Arn ]
+      Artifacts:
+        Type: S3
+        Location: !Ref ArtifactStoreS3Location
+        Name: !Sub BuildRestAppCFN-${AWS::StackName}
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:2.0
+      Source:
+        Location: !Sub https://git-codecommit.us-east-2.amazonaws.com/v1/repos/${ApplicationRepoName}
+        Type: CODECOMMIT
+      TimeoutInMinutes: 15
+      Tags:
+        - Key: Name
+          Value: !Sub BuildRestAppCFN-${AWS::StackName}
 
-    # Fetch all dependencies
-    - go get ./...
 
-    # Ensure code passes all lint tests
-    - golint -set_exit_status
+  CodeDeployServiceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName:
+        Fn::Sub: CodeDeployServiceRole-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codedeploy.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: "CodeDeployCICDAccessPolicy"
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ec2:DescribeInstances'
+                  - 'ec2:DescribeInstanceStatus'
+                  - 'ec2:TerminateInstances'
+                  - 'tag:GetTags'
+                  - 'tag:GetResources'
+                  - 'sns:Publish'
+                  - 'cloudwatch:DescribeAlarms'
+                  - 'cloudwatch:PutMetricAlarm'
+                Resource: '*'
 
-    # Check for common Go application problems with 'go vet'-
-     - go vet 
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties: 
+      ApplicationName: !Sub RestApp-${AWS::StackName}
+      ComputePlatform: Server
 
-    # Run all tests included with our application
-    - go test 
+  CodeDeployDeploymentGroup: 
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties: 
+      ApplicationName: !Ref CodeDeployApplication
+      Ec2TagFilters: 
+        - Key: Name
+          Value: dev
+          Type: "KEY_AND_VALUE"
+      ServiceRoleArn: !GetAtt [ CodeDeployServiceRole, Arn ]      
+      DeploymentGroupName: !Sub DeploymentGroup-${AWS::StackName}
 
-  build:
-    commands:
+  ProdCodeDeployDeploymentGroup: 
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties: 
+      ApplicationName: !Ref CodeDeployApplication
+      Ec2TagFilters: 
+        - Key: Name
+          Value: prod
+          Type: "KEY_AND_VALUE"
+      ServiceRoleArn: !GetAtt [ CodeDeployServiceRole, Arn ]      
+      DeploymentGroupName: !Sub ProdDeploymentGroup-${AWS::StackName}
 
-    # Build our go application
-    - go build -o main
 
-    # Copy static assets to S3, and package application with AWS CloudFormation/SAM
-    - aws s3 cp --recursive public/ s3://$WEBSITE_S3_BUCKET/public/ --grants read=uri=http://acs.amazonaws.com/groups/global/AllUsers
-    - sed -i -e "s|assets/|$WEBSITE_S3_PREFIX/public/assets/|g" public/index.html
-    - aws cloudformation package --template template.yml --s3-bucket $S3_BUCKET --output-template template-export.yml
 
-  post_build:
-    commands:
-    # Do not remove this statement. This command is required for AWS CodeStar projects.
-    # Update the AWS Partition, AWS Region, account ID and project ID in the project ARN on template-configuration.json file so AWS CloudFormation can tag project resources.
-    - sed -i.bak 's/\$PARTITION\$/'${PARTITION}'/g;s/\$AWS_REGION\$/'${AWS_REGION}'/g;s/\$ACCOUNT_ID\$/'${ACCOUNT_ID}'/g;s/\$PROJECT_ID\$/'${PROJECT_ID}'/g' template-configuration.json
+  CodePipelineSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !Ref Email
+          Protocol: email
 
-artifacts:
-  files:
-  - template-export.yml
-  - template-configuration.json
+  CodePipelineRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName:
+        Fn::Sub: CodePipelineRole-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "codepipeline.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+      Policies:
+        - PolicyName: "CodePipelineCICDAccessPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "s3:DeleteObject"
+                  - "s3:GetObject"
+                  - "s3:GetObjectVersion"
+                  - "s3:ListBucket"
+                  - "s3:PutObject"
+                  - "s3:GetBucketPolicy"
+                Resource:
+                  - Fn::Sub: arn:aws:s3:::${ArtifactStoreS3Location}
+                  - Fn::Sub: arn:aws:s3:::${ArtifactStoreS3Location}/*
+              - Effect: "Allow"
+                Action:
+                  - "sns:Publish"
+                Resource: '*'
+              - Effect: "Allow"
+                Action:
+                  - "codecommit:ListBranches"
+                  - "codecommit:ListRepositories"
+                  - "codecommit:BatchGetRepositories"
+                  - "codecommit:Get*"
+                  - "codecommit:GitPull"
+                  - "codecommit:UploadArchive"
+                Resource:
+                  - Fn::Sub: arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${ApplicationRepoName}
+              - Effect: "Allow"
+                Action:
+                  - "codebuild:StartBuild"
+                  - "codebuild:BatchGetBuilds"
+                Resource:
+                  - Fn::Sub: arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/BuildRestAppCFN-${AWS::StackName}
+                  - Fn::Sub: arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:build/BuildRestAppCFN-${AWS::StackName}:*
+              - Effect: Allow
+                Action:
+                  - 'codedeploy:CreateDeployment'
+                  - 'codedeploy:GetApplicationRevision'
+                  - 'codedeploy:GetDeployment'
+                  - 'codedeploy:GetDeploymentConfig'
+                  - 'codedeploy:RegisterApplicationRevision'
+                Resource: '*'
+
+  DeployPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name:  !Sub CICDPipe-${AWS::StackName}
+      RoleArn: !GetAtt [CodePipelineRole, Arn]
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: ApplicationSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: 1
+                Provider: CodeCommit
+              OutputArtifacts:
+                - Name: ApplicationOutput
+              Configuration:
+                BranchName: master
+                RepositoryName: !Ref ApplicationRepoName
+              RunOrder: 1                                                                    
+        - Name: Build
+          Actions:
+            - Name: CodeBuild
+              InputArtifacts:
+                - Name: ApplicationOutput
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              OutputArtifacts:
+                - Name: RestAppArtifact
+              Configuration:
+                ProjectName: !Ref BuildRestAppCFNProject
+              RunOrder: 1                                                                
+        - Name: DeployToStaging
+          Actions:
+            - Name: CodeDeploy
+              InputArtifacts:
+                - Name: RestAppArtifact
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: CodeDeploy
+              Configuration:
+                ApplicationName: !Ref CodeDeployApplication
+                DeploymentGroupName: !Ref CodeDeployDeploymentGroup
+              RunOrder: 1                                                
+        #- Name: ProductionApproval
+        #- Name: DeployToProduction 
+      ArtifactStore:
+        Type: S3
+        Location: !Ref  ArtifactStoreS3Location                      
